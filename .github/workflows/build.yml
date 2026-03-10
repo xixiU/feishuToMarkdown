@@ -1,0 +1,28 @@
+name: Build Chrome Extension
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Create zip package
+      run: |
+        cd chrome-extension
+        zip -r ../feishu-to-markdown-extension.zip . -x "*.git*" -x "generate_icons.py" -x "__pycache__/*"
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: chrome-extension-${{ github.sha }}
+        path: feishu-to-markdown-extension.zip
+        retention-days: 30
