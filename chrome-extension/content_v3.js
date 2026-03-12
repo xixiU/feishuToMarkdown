@@ -630,7 +630,7 @@
 
     function init() {
         // 检查是否在飞书文档页面
-        if (!window.location.pathname.match(/\/(docx|docs)\//)) {
+        if (!window.location.pathname.match(/\/(docx|docs|wiki)\//)) {
             console.log('不在飞书文档页面，跳过初始化');
             return;
         }
