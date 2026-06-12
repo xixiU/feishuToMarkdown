@@ -150,17 +150,25 @@ document.addEventListener('DOMContentLoaded', function() {
 
         try {
             const outputName = selectedFile.name.replace(/\.docx$/i, '');
+            const imageType = imageBase64.checked ? 'base64' : 'local';
             showStatus('⏳ 解析文档...', 'loading');
-            const { markdown, images, warnings } = await convertDocxToMarkdown(selectedFile);
+            const { markdown, images, warnings } = await convertDocxToMarkdown(selectedFile, imageType);
 
-            showStatus(`⏳ 打包文件 (${images.length} 张图片)...`, 'loading');
-            const blob = await packageOutput(outputName, markdown, images);
+            const isBase64Mode = imageType === 'base64';
+            const imgCountText = isBase64Mode
+                ? '图片已嵌入 Markdown'
+                : `${images.length} 张图片`;
+            showStatus(`⏳ 打包文件 (${imgCountText})...`, 'loading');
+            const blob = await packageOutput(outputName, markdown, images, isBase64Mode);
 
             triggerDownload(blob, `${outputName}.zip`);
 
-            const msg = warnings.length > 0
-                ? `✅ 转换完成！${images.length} 张图片\n⚠ 有 ${warnings.length} 条提示，请查看控制台`
+            const baseMsg = isBase64Mode
+                ? `✅ 转换完成！图片已 Base64 嵌入 Markdown`
                 : `✅ 转换完成！${images.length} 张图片`;
+            const msg = warnings.length > 0
+                ? `${baseMsg}\n⚠ 有 ${warnings.length} 条提示，请查看控制台`
+                : baseMsg;
             showStatus(msg, 'success');
             convertBtn.textContent = '再次转换';
         } catch (error) {
@@ -172,22 +180,64 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
 
-    async function convertDocxToMarkdown(file) {
+    async function convertDocxToMarkdown(file, imageType) {
         const arrayBuffer = await file.arrayBuffer();
         const images = [];
+        const useBase64 = imageType === 'base64';
 
-        // Step 1: 使用 mammoth.js 将 docx 转换为 HTML，同时提取图片
+        // 本地图片模式：先从 docx 的 word/media 中直接提取所有图片，
+        // 这样不依赖 mammoth 的图片回退行为，避免漏图。
+        if (!useBase64) {
+            try {
+                const zip = await JSZip.loadAsync(arrayBuffer);
+                const mediaFolder = zip.folder('word/media');
+                if (mediaFolder) {
+                    let index = 1;
+                    for (const [filename, entry] of Object.entries(mediaFolder.files)) {
+                        if (entry.dir) continue;
+                        const ext = (filename.split('.').pop() || '').toLowerCase();
+                        if (!['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext)) continue;
+                        const base64Data = await entry.async('base64');
+                        const imgFilename = `image_${String(index).padStart(3, '0')}.${ext}`;
+                        images.push({
+                            filename: imgFilename,
+                            base64: base64Data,
+                            contentType: `image/${ext === 'jpg' ? 'jpeg' : ext}`
+                        });
+                        index++;
+                    }
+                    console.log(`从 docx 中提取了 ${images.length} 张图片`);
+                }
+            } catch (error) {
+                console.warn('从 docx 预提取图片失败，将回退到 mammoth 提取:', error);
+            }
+        }
+
+        // 把 base64 数据落盘为本地图片，返回相对路径（用于本地模式 / data URI 兜底）
+        function registerLocalImage(base64Data, contentType) {
+            const existing = images.findIndex(img => img.base64 === base64Data);
+            if (existing >= 0) {
+                return `./images/${images[existing].filename}`;
+            }
+            const ext = ((contentType || 'image/png').split('/')[1] || 'png').split('+')[0];
+            const validExt = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext) ? ext : 'png';
+            const imgFilename = `image_${String(images.length + 1).padStart(3, '0')}.${validExt}`;
+            images.push({ filename: imgFilename, base64: base64Data, contentType: contentType || 'image/png' });
+            return `./images/${imgFilename}`;
+        }
+
+        // Step 1: 使用 mammoth.js 将 docx 转换为 HTML，同时处理图片
         const result = await mammoth.convertToHtml({
             arrayBuffer: arrayBuffer,
             convertImage: mammoth.images.imgElement(function(image) {
                 return image.read('base64').then(function(base64Data) {
                     const contentType = image.contentType || 'image/png';
-                    const ext = (contentType.split('/')[1] || 'png').split('+')[0];
-                    const validExt = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext) ? ext : 'png';
-                    const index = images.length + 1;
-                    const imgFilename = `image_${String(index).padStart(3, '0')}.${validExt}`;
-                    images.push({ filename: imgFilename, base64: base64Data, contentType });
-                    return { src: `./images/${imgFilename}` };
+                    if (useBase64) {
+                        // Base64 模式：直接嵌入 markdown
+                        return { src: `data:${contentType};base64,${base64Data}` };
+                    }
+                    // 本地模式：落盘并使用相对路径
+                    return { src: registerLocalImage(base64Data, contentType) };
                 });
             })
         });
@@ -205,13 +255,25 @@ document.addEventListener('DOMContentLoaded', function() {
             emDelimiter: '*'
         });
 
-        // 图片规则：使用提取后的路径
+        // 图片规则：本地模式下对残留的 data URI 做兜底，转为本地图片
+        const dataUriPattern = /^data:([^;,]+)?(?:;[^,]*)*;base64,(.*)$/i;
         turndownService.addRule('images', {
             filter: 'img',
             replacement: function(content, node) {
                 const alt = node.getAttribute('alt') || '';
-                const src = node.getAttribute('src') || '';
-                return src ? `\n![${alt}](${src})\n` : '';
+                let src = node.getAttribute('src') || '';
+                if (!src) return '';
+
+                if (!useBase64) {
+                    const m = src.match(dataUriPattern);
+                    if (m) {
+                        // 选了本地图片但 src 仍是 base64：落盘并改写为相对路径
+                        const contentType = m[1] || 'image/png';
+                        const base64Data = m[2];
+                        src = registerLocalImage(base64Data, contentType);
+                    }
+                }
+                return `\n![${alt}](${src})\n`;
             }
         });
 
@@ -232,11 +294,12 @@ document.addEventListener('DOMContentLoaded', function() {
         return { markdown, images, warnings };
     }
 
-    async function packageOutput(docName, markdown, images) {
+    async function packageOutput(docName, markdown, images, isBase64Mode) {
         const zip = new JSZip();
         zip.file(`${docName}.md`, markdown);
 
-        if (images.length > 0) {
+        // Base64 模式下图片已内嵌在 markdown 中，不再生成 images 目录
+        if (!isBase64Mode && images.length > 0) {
             const imgFolder = zip.folder('images');
             for (const img of images) {
                 // base64 转 Uint8Array

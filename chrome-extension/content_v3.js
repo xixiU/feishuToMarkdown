@@ -319,7 +319,25 @@
             replacement: function(content, node) {
                 const alt = node.getAttribute('alt') || '';
                 const src = node.getAttribute('src') || '';
-                return src ? `\n![${alt}](${src})\n` : '';
+                if (!src) return '';
+
+                // 本地模式下，若 mammoth 回退成了 data URI（如 WMF/EMF 等格式），
+                // 将其提取并落盘到 images 数组，改写为相对路径
+                if (!useBase64 && src.startsWith('data:')) {
+                    const match = src.match(/^data:([^;]+);base64,(.+)$/);
+                    if (match) {
+                        const contentType = match[1];
+                        const base64Data = match[2];
+                        const ext = (contentType.split('/')[1] || 'png').split('+')[0];
+                        const validExt = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext) ? ext : 'png';
+                        const imgIndex = images.length + 1;
+                        const imgFilename = `image_${String(imgIndex).padStart(3, '0')}.${validExt}`;
+                        images.push({ filename: imgFilename, base64: base64Data, contentType });
+                        return `\n![${alt}](./images/${imgFilename})\n`;
+                    }
+                }
+
+                return `\n![${alt}](${src})\n`;
             }
         });
 
